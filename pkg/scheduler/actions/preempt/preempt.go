@@ -308,6 +308,11 @@ func (pmpt *Action) preempt(
 
 	// we should filter out those nodes that are UnschedulableAndUnresolvable status got in allocate action
 	allNodes := ssn.FilterOutUnschedulableAndUnresolvableNodesForTask(preemptor)
+	if ssn.DRAPreemptionEligible(preemptor) {
+		// DRA reports device exhaustion as unresolvable before victim claims
+		// are released; the candidate predicate still checks hard constraints.
+		allNodes = ssn.NodeList
+	}
 	predicateNodes, _ := predicateHelper.PredicateNodes(preemptor, allNodes, ssn.PredicateForPreemptAction, pmpt.enablePredicateErrorCache, ssn.NodesInShard)
 
 	candidateNodes := util.GetPredicatedNodeByShard(predicateNodes, ssn.NodesInShard)
@@ -335,7 +340,38 @@ func (pmpt *Action) normalPreempt(
 ) (bool, error) {
 	nodeScores := util.PrioritizeNodes(preemptor, predicateNodes, ssn.BatchNodeOrderFn, ssn.NodeOrderMapFn, ssn.NodeOrderReduceFn)
 
-	selectedNodes := util.SortNodes(nodeScores)
+	// Let a plugin order candidates; without a choice, retain the original score order.
+	// ponytail: repeated BestNode calls are O(n²); add an ordering hook only if large candidate sets make this costly.
+	selectedNodes := make([]*api.NodeInfo, 0, len(predicateNodes))
+	for len(nodeScores) > 0 {
+		best := ssn.BestNodeFn(preemptor, nodeScores)
+		if best == nil {
+			selectedNodes = append(selectedNodes, util.SortNodes(nodeScores)...)
+			break
+		}
+		found := false
+		for score, nodes := range nodeScores {
+			for i, node := range nodes {
+				if node.Name != best.Name {
+					continue
+				}
+				selectedNodes = append(selectedNodes, node)
+				nodeScores[score] = append(nodes[:i], nodes[i+1:]...)
+				if len(nodeScores[score]) == 0 {
+					delete(nodeScores, score)
+				}
+				found = true
+				break
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			selectedNodes = append(selectedNodes, util.SortNodes(nodeScores)...)
+			break
+		}
+	}
 
 	job, found := ssn.Jobs[preemptor.Job]
 	if !found {
@@ -432,7 +468,7 @@ func (pmpt *Action) normalPreempt(
 func preemptorFitsOnNode(ssn *framework.Session, queue *api.QueueInfo, preemptor *api.TaskInfo, node *api.NodeInfo) bool {
 	return ssn.Allocatable(queue, preemptor) &&
 		preemptor.InitResreq.LessEqual(node.FutureIdle(), api.Zero) &&
-		ssn.PredicateFn(preemptor, node) == nil
+		ssn.PredicateAfterPreemption(preemptor, node) == nil
 }
 
 func (pmpt *Action) taskEligibleToPreempt(preemptor *api.TaskInfo) error {

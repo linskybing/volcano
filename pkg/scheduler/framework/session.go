@@ -111,25 +111,28 @@ type Session struct {
 	RealNodesSet              map[string]sets.Set[string]
 	HyperNodesReadyToSchedule bool
 
-	plugins             map[string]Plugin
-	eventHandlers       []*EventHandler
-	jobOrderFns         map[string]api.CompareFn
-	queueOrderFns       map[string]api.CompareFn
-	victimQueueOrderFns map[string]api.VictimCompareFn
-	taskOrderFns        map[string]api.CompareFn
-	clusterOrderFns     map[string]api.CompareFn
-	predicateFns        map[string]api.PredicateFn
-	prePredicateFns     map[string]api.PrePredicateFn
-	bestNodeFns         map[string]api.BestNodeFn
-	nodeOrderFns        map[string]api.NodeOrderFn
-	batchNodeOrderFns   map[string]api.BatchNodeOrderFn
-	nodeMapFns          map[string]api.NodeMapFn
-	nodeReduceFns       map[string]api.NodeReduceFn
-	hyperNodeOrderFns   map[string]api.HyperNodeOrderFn
-	preemptableFns      map[string]api.EvictableFn
-	reclaimableFns      map[string]api.EvictableFn
-	unifiedEvictableFns map[string]api.UnifiedEvictableFn
-	overusedFns         map[string]api.ValidateFn
+	plugins                      map[string]Plugin
+	eventHandlers                []*EventHandler
+	jobOrderFns                  map[string]api.CompareFn
+	queueOrderFns                map[string]api.CompareFn
+	victimQueueOrderFns          map[string]api.VictimCompareFn
+	taskOrderFns                 map[string]api.CompareFn
+	clusterOrderFns              map[string]api.CompareFn
+	predicateFns                 map[string]api.PredicateFn
+	preemptPredicateFns          map[string]api.PredicateFn
+	preemptCandidatePredicateFns map[string]api.PredicateFn
+	draPreemptionEligibleFns     map[string]func(*api.TaskInfo) bool
+	prePredicateFns              map[string]api.PrePredicateFn
+	bestNodeFns                  map[string]api.BestNodeFn
+	nodeOrderFns                 map[string]api.NodeOrderFn
+	batchNodeOrderFns            map[string]api.BatchNodeOrderFn
+	nodeMapFns                   map[string]api.NodeMapFn
+	nodeReduceFns                map[string]api.NodeReduceFn
+	hyperNodeOrderFns            map[string]api.HyperNodeOrderFn
+	preemptableFns               map[string]api.EvictableFn
+	reclaimableFns               map[string]api.EvictableFn
+	unifiedEvictableFns          map[string]api.UnifiedEvictableFn
+	overusedFns                  map[string]api.ValidateFn
 	// preemptiveFns means whether current queue can reclaim from other queue,
 	// while reclaimableFns means whether current queue's resources can be reclaimed.
 	preemptiveFns                 map[string]api.ValidateWithCandidateFn
@@ -193,6 +196,9 @@ func openSession(cache cache.Cache) *Session {
 		taskOrderFns:                  map[string]api.CompareFn{},
 		clusterOrderFns:               map[string]api.CompareFn{},
 		predicateFns:                  map[string]api.PredicateFn{},
+		preemptPredicateFns:           map[string]api.PredicateFn{},
+		preemptCandidatePredicateFns:  map[string]api.PredicateFn{},
+		draPreemptionEligibleFns:      map[string]func(*api.TaskInfo) bool{},
 		prePredicateFns:               map[string]api.PrePredicateFn{},
 		bestNodeFns:                   map[string]api.BestNodeFn{},
 		nodeOrderFns:                  map[string]api.NodeOrderFn{},
@@ -686,7 +692,12 @@ func (ssn *Session) PredicateForAllocateAction(task *api.TaskInfo, node *api.Nod
 // - UnschedulableAndUnresolvable
 // - ErrorSkipOrWait
 func (ssn *Session) PredicateForPreemptAction(task *api.TaskInfo, node *api.NodeInfo) error {
-	err := ssn.PredicateFn(task, node)
+	var err error
+	if ssn.DRAPreemptionEligible(task) {
+		err = ssn.PredicateBeforePreemption(task, node)
+	} else {
+		err = ssn.PredicateFn(task, node)
+	}
 	if err == nil {
 		return nil
 	}
