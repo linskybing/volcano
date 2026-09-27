@@ -109,4 +109,30 @@ show() { kubectl get pods -o custom-columns=SVC:.metadata.labels.app\\.kubernete
 | 5 | `training t3 high` | J2/J4 PDBs now allow 0 disruptions, so worker2/3 are skipped; t3 preempts worker4 (last resort) |
 | 6 | `training t4 high` | no legal candidate: t4 Pending, no evictions |
 
+### DRA variant
+
+The same steps and expectations apply with real DRA devices from the [dra-example-driver](https://github.com/kubernetes-sigs/dra-example-driver) (8 fake `gpu.example.com` devices per node). Differences from the steps above:
+
+```bash
+# 1. The kind config needs CDI (add under the top level):
+#    containerdConfigPatches:
+#    - |-
+#      [plugins."io.containerd.grpc.v1.cri"]
+#        enable_cdi = true
+# 2. Skip the node status patch; install the driver instead:
+git clone --depth 1 --branch v0.5.0 https://github.com/kubernetes-sigs/dra-example-driver
+helm upgrade -i --create-namespace -n dra-example-driver dra-example-driver dra-example-driver/deployments/helm/dra-example-driver --wait
+# 3. In volcano-scheduler.conf, give predicates `arguments: {predicate.DynamicResourceAllocationEnable: true}`.
+# 4. One claim per Pod, from templates:
+for n in 1 8; do kubectl apply -f - <<YAML
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata: {name: gpu$n}
+spec: {spec: {devices: {requests: [{name: gpu, exactly: {deviceClassName: gpu.example.com, allocationMode: ExactCount, count: $n}}]}}}
+YAML
+done
+```
+
+In the helpers, replace `limits: {nvidia.com/gpu: N}` with `claims: [{name: gpu}]` and add `resourceClaims: [{name: gpu, resourceClaimTemplateName: gpuN}]` to the Pod spec (`gpu1` for inference, `gpu8` for training). Check claim placement (one line per claim; a training claim holds all 8 devices; blank = unallocated) with `kubectl get resourceclaims -o jsonpath='{range .items[*]}{.status.allocation.devices.results[0].pool}{"\n"}{end}' | sort | uniq -c`.
+
 Decisions are logged at `-v=4` (`rr-binpack selected node`, `Considering Task`, `Try to preempt Task`). Clean up with `kind delete cluster --name rr`.

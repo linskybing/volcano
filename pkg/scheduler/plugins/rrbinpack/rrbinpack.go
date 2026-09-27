@@ -183,7 +183,7 @@ func (p *plugin) OnSessionOpen(ssn *framework.Session) {
 					default:
 						rank = 3
 					}
-					count = len(node.Tasks)
+					count = p.classTasks(node, p.inferenceValue) // only inference can be a victim
 				}
 				if best == nil || rank < bestRank || rank == bestRank && (class == p.inferenceValue && zone == p.rrZoneValue &&
 					(count < bestCount || count == bestCount && node.Name < best.Name) ||
@@ -242,12 +242,17 @@ func (p *plugin) serviceReplicas(node *api.NodeInfo, namespace, service string) 
 }
 
 func (p *plugin) hasTraining(node *api.NodeInfo) bool {
+	return p.classTasks(node, p.trainingValue) > 0
+}
+
+func (p *plugin) classTasks(node *api.NodeInfo, class string) int {
+	count := 0
 	for _, task := range node.Tasks {
-		if task.Status != api.Releasing && p.workloadClass(task) == p.trainingValue {
-			return true
+		if task.Status != api.Releasing && p.workloadClass(task) == class {
+			count++
 		}
 	}
-	return false
+	return count
 }
 
 // packScorer returns a MostAllocated-style score for Binpack nodes that already
