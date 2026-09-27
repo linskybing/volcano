@@ -42,3 +42,71 @@ Training first uses a fitting Binpack node. If none fits, normal preemption cons
 After successful preemption, Volcano evicts the victims and nominates the training Pod to the chosen node. Victim termination (and, with DRA, claim release) is asynchronous: training remains Pending until the resources are freed and the ordinary predicates can bind it. During this interval, lower-priority inference replacements cannot take the nominated node. Controllers recreate evicted Pods and they schedule normally elsewhere. Use `enableTopologyAwarePreemption: false` for the normal preempt action (the default).
 
 For DRA, this policy requires a functioning DRA driver and the [Volcano DRA setup](how_to_enable_dra.md). End-to-end validation on a real cluster is required before production use; fake scheduler tests cannot verify driver release timing or kubelet behavior.
+
+## Manual verification (kind, fake GPUs)
+
+No GPUs are needed: each worker advertises `nvidia.com/gpu: 8` as an extended resource. Workers 1–3 play A/B/C (rr) and workers 4–5 play D/E (binpack).
+
+```bash
+printf 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n- role: control-plane\n%s' "$(printf -- '- role: worker\n%.0s' 1 2 3 4 5)" | kind create cluster --name rr --config -
+i=0; for n in rr-worker rr-worker2 rr-worker3 rr-worker4 rr-worker5; do i=$((i+1)); z=rr; [ $i -ge 4 ] && z=binpack
+  kubectl label node $n volcano.sh/nodegroup-name=$z
+  kubectl patch node $n --subresource=status --type=json -p '[{"op":"add","path":"/status/capacity/nvidia.com~1gpu","value":"8"}]'; done
+make vc-scheduler-image TAG=rr-test && kind load docker-image volcanosh/vc-scheduler:rr-test --name rr
+helm install volcano installer/helm/chart/volcano -n volcano-system --create-namespace \
+  --set basic.scheduler_image_tag_version=rr-test --set basic.image_pull_policy=IfNotPresent
+# Put the tiers above (without the DRA argument) into volcano-scheduler.conf, then:
+kubectl -n volcano-system create configmap volcano-scheduler-configmap --from-file=volcano-scheduler.conf --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n volcano-system rollout restart deploy/volcano-scheduler
+for p in low:10 medium:50 high:100; do kubectl create priorityclass ${p%:*} --value=${p#*:}; done
+```
+
+Helpers (`inference J1`, `training t1 medium`, `pdb J1`, `show`):
+
+```bash
+inference() {
+kubectl apply -f - <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: $(echo $1 | tr A-Z a-z)}
+spec:
+  replicas: 6
+  selector: {matchLabels: {app.kubernetes.io/name: $1}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: $1, volcano.sh/workload-class: inference}
+      annotations: {volcano.sh/preemptable: "true"}
+    spec:
+      schedulerName: volcano
+      priorityClassName: low
+      terminationGracePeriodSeconds: 0
+      containers: [{name: c, image: registry.k8s.io/pause:3.10, resources: {requests: {cpu: 10m}, limits: {nvidia.com/gpu: 1}}}]
+YAML
+}
+training() {
+kubectl apply -f - <<YAML
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata: {name: $1}
+spec:
+  schedulerName: volcano
+  minAvailable: 1
+  priorityClassName: $2
+  tasks:
+  - {name: worker, replicas: 1, template: {metadata: {labels: {volcano.sh/workload-class: training}}, spec: {priorityClassName: $2, terminationGracePeriodSeconds: 0, containers: [{name: c, image: registry.k8s.io/pause:3.10, resources: {requests: {cpu: 10m}, limits: {nvidia.com/gpu: 8}}}]}}}
+YAML
+}
+pdb() { kubectl create pdb $(echo $1 | tr A-Z a-z) --selector=app.kubernetes.io/name=$1 --min-available=${2:-4}; }
+show() { kubectl get pods -o custom-columns=SVC:.metadata.labels.app\\.kubernetes\\.io/name,JOB:.metadata.labels.volcano\\.sh/job-name,NODE:.spec.nodeName,PHASE:.status.phase --no-headers | sort | uniq -c; }
+```
+
+| Step | Command | Expected |
+|---|---|---|
+| 1 | `for j in J1 J2 J3 J4; do inference $j; pdb $j; done` | each service 2/2/2 on workers 1–3; workers 4–5 empty |
+| 2 | `inference J5` | 6 × J5 on worker4; worker5 empty |
+| 3 | `training t1 medium` | t1 on worker5, no evictions |
+| 4 | `training t2 high` | 2 × J1–J4 evicted from worker1; t2 on worker1; t1 stays; 2 replacements on worker4, 6 Pending |
+| 5 | `training t3 high` | J2/J4 PDBs now allow 0 disruptions, so worker2/3 are skipped; t3 preempts worker4 (last resort) |
+| 6 | `training t4 high` | no legal candidate: t4 Pending, no evictions |
+
+Decisions are logged at `-v=4` (`rr-binpack selected node`, `Considering Task`, `Try to preempt Task`). Clean up with `kind delete cluster --name rr`.
