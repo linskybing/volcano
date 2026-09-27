@@ -60,6 +60,9 @@ func rrBinpackGPUFixture(running, pending []string) *uthelper.TestCommonStruct {
 	for _, g := range running {
 		add(g, true)
 	}
+	// A non-policy system pod on A must not affect the victim-count tie-break.
+	fixture.Pods = append(fixture.Pods, util.BuildPod("kube-system", "daemon", "A", v1.PodRunning,
+		api.BuildResourceList("10m", "16Mi"), "", nil, nil))
 	for _, g := range pending {
 		add(g, false)
 	}
@@ -139,7 +142,7 @@ func TestRRBinpackGPUPreemption(t *testing.T) {
 			}
 			fixture.ExpectEvictNum = tc.wantEvictions
 			for _, pod := range fixture.Pods {
-				if tc.wantNode != "" && pod.Spec.NodeName == tc.wantNode {
+				if tc.wantNode != "" && pod.Spec.NodeName == tc.wantNode && pod.Labels["volcano.sh/workload-class"] == "inference" {
 					fixture.ExpectEvicted = append(fixture.ExpectEvicted, "test/"+pod.Name)
 				}
 			}
