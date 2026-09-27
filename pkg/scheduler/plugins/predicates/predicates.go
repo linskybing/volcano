@@ -317,6 +317,22 @@ func (pp *PredicatesPlugin) OnSessionOpen(ssn *framework.Session) {
 		state := ssn.GetCycleState(task.UID)
 		return pp.Predicate(task, node, state)
 	})
+	ssn.AddPreemptPredicateFn(pp.Name(), func(task *api.TaskInfo, node *api.NodeInfo) error {
+		state := ssn.GetCycleState(task.UID)
+		if !ssn.DRAPreemptionEligible(task) || !hasReleasingDRAClaim(node) {
+			return pp.Predicate(task, node, state)
+		}
+		if err := pp.predicate(task, node, state, true); err != nil {
+			return err
+		}
+		return pp.draFitsAfterEviction(ssn, task, node)
+	})
+	ssn.AddPreemptCandidatePredicateFn(pp.Name(), func(task *api.TaskInfo, node *api.NodeInfo) error {
+		if !ssn.DRAPreemptionEligible(task) {
+			return pp.Predicate(task, node, ssn.GetCycleState(task.UID))
+		}
+		return pp.predicate(task, node, ssn.GetCycleState(task.UID), true)
+	})
 
 	// TODO: Need to unify the plugins in nodeorder to predicates.
 	// Currently, if the volumebinding plugin crosses predicates plugins and nodeorder plugins, it involves two initializations, which increases memory overhead.
@@ -646,6 +662,10 @@ func (pp *PredicatesPlugin) InitPlugin() {
 
 // Predicate runs all Filter plugins for the given task and node.
 func (pp *PredicatesPlugin) Predicate(task *api.TaskInfo, node *api.NodeInfo, state *k8sframework.CycleState) error {
+	return pp.predicate(task, node, state, false)
+}
+
+func (pp *PredicatesPlugin) predicate(task *api.TaskInfo, node *api.NodeInfo, state *k8sframework.CycleState, skipDRA bool) error {
 	predicateStatus := make([]*api.Status, 0)
 	nodeInfo, err := pp.Handle.SnapshotSharedLister().NodeInfos().Get(node.Name)
 	if err != nil {
@@ -676,6 +696,9 @@ func (pp *PredicatesPlugin) Predicate(task *api.TaskInfo, node *api.NodeInfo, st
 		predicateStatus := make([]*api.Status, 0)
 
 		for _, name := range pp.StableFilterOrder {
+			if skipDRA && name == dynamicresources.Name {
+				continue
+			}
 			plugin, exists := pp.StableFilterPlugins[name]
 			if !exists {
 				continue
@@ -699,7 +722,7 @@ func (pp *PredicatesPlugin) Predicate(task *api.TaskInfo, node *api.NodeInfo, st
 	// Check PredicateWithCache
 	var fit bool
 	predicateCacheStatus := make([]*api.Status, 0)
-	if pp.enabledPredicates.cacheEnable {
+	if pp.enabledPredicates.cacheEnable && !skipDRA {
 		fit, err = pp.PredicateCache.PredicateWithCache(node.Name, task.Pod)
 		if err != nil {
 			predicateCacheStatus, fit, _ = predicateByStablefilter(nodeInfo)
@@ -723,6 +746,9 @@ func (pp *PredicatesPlugin) Predicate(task *api.TaskInfo, node *api.NodeInfo, st
 
 	// Run all Filter plugins (except those in StableFilterPlugins)
 	for _, name := range pp.FilterOrder {
+		if skipDRA && name == dynamicresources.Name {
+			continue
+		}
 		plugin, exists := pp.FilterPlugins[name]
 		if !exists {
 			continue
@@ -794,6 +820,10 @@ func (pp *PredicatesPlugin) runReservePlugins(ssn *framework.Session, event *fra
 	state := ssn.GetCycleState(event.Task.UID)
 
 	for _, name := range pp.ReserveOrder {
+		if name == dynamicresources.Name && event.Task.Status == api.Pipelined && event.Task.EvictionOccurred &&
+			ssn.DRAPreemptionEligible(event.Task) {
+			continue // DRA allocation is performed after the victim claims are released.
+		}
 		plugin, exists := pp.ReservePlugins[name]
 		if !exists {
 			continue

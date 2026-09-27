@@ -95,6 +95,39 @@ func (ssn *Session) AddPredicateFn(name string, pf api.PredicateFn) {
 	ssn.predicateFns[name] = pf
 }
 
+// AddPreemptPredicateFn overrides a plugin's predicate while checking fit
+// after tentative victim eviction. Other scheduling paths use PredicateFn.
+func (ssn *Session) AddPreemptPredicateFn(name string, pf api.PredicateFn) {
+	ssn.preemptPredicateFns[name] = pf
+}
+
+// AddPreemptCandidatePredicateFn supplies a candidate filter before victims
+// are selected, when their DRA claims are still allocated.
+func (ssn *Session) AddPreemptCandidatePredicateFn(name string, pf api.PredicateFn) {
+	ssn.preemptCandidatePredicateFns[name] = pf
+}
+
+// AddDRAPreemptionEligibleFn opts a plugin's tasks into DRA claim-release simulation.
+func (ssn *Session) AddDRAPreemptionEligibleFn(name string, fn func(*api.TaskInfo) bool) {
+	ssn.draPreemptionEligibleFns[name] = fn
+}
+
+func (ssn *Session) DRAPreemptionEligible(task *api.TaskInfo) bool {
+	if len(task.ResourceClaimKeys) == 0 {
+		return false
+	}
+	for _, tier := range ssn.Tiers {
+		for _, plugin := range tier.Plugins {
+			if isEnabled(plugin.EnabledPredicate) && isEnabled(plugin.EnabledPreemptable) {
+				if fn := ssn.draPreemptionEligibleFns[plugin.Name]; fn != nil && fn(task) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // AddPrePredicateFn add PrePredicate function
 func (ssn *Session) AddPrePredicateFn(name string, pf api.PrePredicateFn) {
 	ssn.prePredicateFns[name] = pf
@@ -860,6 +893,48 @@ func (ssn *Session) PredicateFn(task *api.TaskInfo, node *api.NodeInfo) error {
 			err := pfn(task, node)
 			if err != nil {
 				return err
+			}
+		}
+	}
+	return nil
+}
+
+// PredicateAfterPreemption runs every enabled predicate, using a plugin's
+// post-eviction check when it has one.
+func (ssn *Session) PredicateAfterPreemption(task *api.TaskInfo, node *api.NodeInfo) error {
+	for _, tier := range ssn.Tiers {
+		for _, plugin := range tier.Plugins {
+			if !isEnabled(plugin.EnabledPredicate) {
+				continue
+			}
+			fn := ssn.preemptPredicateFns[plugin.Name]
+			if fn == nil {
+				fn = ssn.predicateFns[plugin.Name]
+			}
+			if fn != nil {
+				if err := fn(task, node); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (ssn *Session) PredicateBeforePreemption(task *api.TaskInfo, node *api.NodeInfo) error {
+	for _, tier := range ssn.Tiers {
+		for _, plugin := range tier.Plugins {
+			if !isEnabled(plugin.EnabledPredicate) {
+				continue
+			}
+			fn := ssn.preemptCandidatePredicateFns[plugin.Name]
+			if fn == nil {
+				fn = ssn.predicateFns[plugin.Name]
+			}
+			if fn != nil {
+				if err := fn(task, node); err != nil {
+					return err
+				}
 			}
 		}
 	}
