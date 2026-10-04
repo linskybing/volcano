@@ -21,18 +21,17 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/framework"
 	"volcano.sh/volcano/pkg/scheduler/plugins/conformance"
 	"volcano.sh/volcano/pkg/scheduler/plugins/gang"
-	"volcano.sh/volcano/pkg/scheduler/plugins/nodegroup"
 	"volcano.sh/volcano/pkg/scheduler/plugins/pdb"
 	"volcano.sh/volcano/pkg/scheduler/plugins/predicates"
 	"volcano.sh/volcano/pkg/scheduler/plugins/priority"
-	"volcano.sh/volcano/pkg/scheduler/plugins/rrbinpack"
+	"volcano.sh/volcano/pkg/scheduler/plugins/workloadplacement"
 	"volcano.sh/volcano/pkg/scheduler/uthelper"
 	"volcano.sh/volcano/pkg/scheduler/util"
 )
 
 const draClass = "gpu.example.com"
 
-func TestRRBinpackDRAPreemption(t *testing.T) {
+func TestWorkloadPlacementDRAPreemption(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
 		blockA        bool
@@ -43,15 +42,15 @@ func TestRRBinpackDRAPreemption(t *testing.T) {
 		wantNode      string
 		wantEvictions int
 	}{
-		{name: "RR before fewer Binpack victims", wantNode: "A", wantEvictions: 8},
+		{name: "fair A before fewer but concentrated D victims", wantNode: "A", wantEvictions: 8},
 		{name: "PDB blocks A, use B", blockA: true, wantNode: "B", wantEvictions: 8},
-		{name: "PDB blocks RR, use Binpack", blockRR: true, wantNode: "D", wantEvictions: 6},
+		{name: "PDB blocks A-C, use D", blockRR: true, wantNode: "D", wantEvictions: 6},
 		{name: "PDB blocks all, leave pending", blockRR: true, blockBinpack: true},
 		{name: "shared victim claim skips A", sharedA: true, wantNode: "B", wantEvictions: 8},
 		{name: "missing victim claim skips A", missingA: true, wantNode: "B", wantEvictions: 8},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			fixture := rrBinpackDRAFixture()
+			fixture := workloadPlacementDRAFixture()
 			if tc.sharedA {
 				for _, claim := range fixture.ResourceClaims {
 					if claim.Name == "J1-1-gpu" {
@@ -61,7 +60,7 @@ func TestRRBinpackDRAPreemption(t *testing.T) {
 					}
 				}
 			}
-			ssn := fixture.RegisterSession(rrBinpackDRATiers(), []conf.Configuration{{Name: "preempt",
+			ssn := fixture.RegisterSession(workloadPlacementDRATiers(), []conf.Configuration{{Name: "preempt",
 				Arguments: map[string]interface{}{EnableTopologyAwarePreemptionKey: false}}})
 			defer fixture.Close()
 			if tc.missingA {
@@ -120,11 +119,12 @@ func TestRRBinpackDRAPreemption(t *testing.T) {
 				}
 				replacement := api.NewTaskInfo(util.BuildPod("test", "replacement", "", v1.PodPending,
 					api.BuildResourceList("100m", "128Mi"), "J1", map[string]string{
-						rrbinpack.WorkloadClassLabel: "inference", "app.kubernetes.io/name": "J1"}, nil))
+						"app.kubernetes.io/name": "J1"}, nil))
+				replacement.Pod.Annotations[workloadplacement.SchedulingAlgorithmsAnnotation] = "rr,binpack"
 				replacement.ResourceClaimKeys = []string{"test/replacement-gpu"}
 				replacement.DRAResreq = map[string]*api.DRAResource{draClass: {Count: 1}}
 				if err := ssn.PredicateFn(replacement, ssn.Nodes[tc.wantNode]); err == nil ||
-					!strings.Contains(err.Error(), "node nominated for training") {
+					!strings.Contains(err.Error(), "node nominated for higher-priority workload") {
 					t.Fatalf("replacement was not blocked on nominated node: %v", err)
 				}
 			} else if task := ssn.Jobs["test/T2"].Tasks["test-T2"]; task != nil && task.Status != api.Pending {
@@ -134,8 +134,8 @@ func TestRRBinpackDRAPreemption(t *testing.T) {
 	}
 }
 
-func TestRRBinpackDRAAfterRelease(t *testing.T) {
-	fixture := rrBinpackDRAFixture()
+func TestWorkloadPlacementDRAAfterRelease(t *testing.T) {
+	fixture := workloadPlacementDRAFixture()
 	for _, pod := range fixture.Pods {
 		if pod.Spec.NodeName == "A" {
 			pod.Spec.NodeName = ""
@@ -157,7 +157,7 @@ func TestRRBinpackDRAAfterRelease(t *testing.T) {
 			}
 		}
 	}
-	ssn := fixture.RegisterSession(rrBinpackDRATiers(), nil)
+	ssn := fixture.RegisterSession(workloadPlacementDRATiers(), nil)
 	defer fixture.Close()
 	fixture.ExpectBindsNum = 3
 	fixture.MinimalBindCheck = true
@@ -193,7 +193,30 @@ func TestRRBinpackDRAAfterRelease(t *testing.T) {
 	}
 }
 
-func TestRRBinpackDRAInitialPlacement(t *testing.T) {
+func TestWorkloadPlacementDRAMixedVictims(t *testing.T) {
+	fixture := workloadPlacementDRAFixture()
+	ssn := fixture.RegisterSession(workloadPlacementDRATiers(), nil)
+	defer fixture.Close()
+	node := ssn.Nodes["A"]
+	for _, victim := range node.Tasks {
+		victim.Status = api.Releasing
+	}
+	cpuOnly := api.NewTaskInfo(util.BuildPod("test", "cpu-only", "A", v1.PodRunning,
+		api.BuildResourceList("100m", "128Mi"), "", map[string]string{"app.kubernetes.io/name": "cpu-only"}, nil))
+	cpuOnly.Status = api.Releasing
+	if err := node.AddTask(cpuOnly); err != nil {
+		t.Fatal(err)
+	}
+	preemptor := ssn.Jobs["test/T2"].Tasks["test-T2"]
+	if err := ssn.PrePredicateFn(preemptor); err != nil {
+		t.Fatal(err)
+	}
+	if err := ssn.PredicateAfterPreemption(preemptor, node); err != nil {
+		t.Fatalf("DRA preemption rejected CPU-only victim: %v", err)
+	}
+}
+
+func TestWorkloadPlacementDRAInitialPlacement(t *testing.T) {
 	for _, tc := range []struct {
 		name, pending string
 		groups        []string
@@ -207,7 +230,7 @@ func TestRRBinpackDRAInitialPlacement(t *testing.T) {
 			pending: "T1", wantBinds: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			fixture := rrBinpackDRAFixture()
+			fixture := workloadPlacementDRAFixture()
 			fixture.PodGroups = slices.DeleteFunc(fixture.PodGroups, func(group *schedulingv1beta1.PodGroup) bool {
 				return !slices.Contains(tc.groups, group.Name)
 			})
@@ -233,7 +256,7 @@ func TestRRBinpackDRAInitialPlacement(t *testing.T) {
 				}
 				return false
 			})
-			ssn := fixture.RegisterSession(rrBinpackDRATiers(), nil)
+			ssn := fixture.RegisterSession(workloadPlacementDRATiers(), nil)
 			defer fixture.Close()
 			fixture.ExpectBindsNum = tc.wantBinds
 			fixture.MinimalBindCheck = true
@@ -281,16 +304,16 @@ func blockingDRAPDB(name, label, value string) *policyv1.PodDisruptionBudget {
 	}
 }
 
-func rrBinpackDRAFixture() *uthelper.TestCommonStruct {
+func workloadPlacementDRAFixture() *uthelper.TestCommonStruct {
 	capacity := api.BuildResourceList("32", "64Gi", api.ScalarResource{Name: "pods", Value: "110"})
 	fixture := &uthelper.TestCommonStruct{
 		Plugins: map[string]framework.PluginBuilder{
-			conformance.PluginName: conformance.New,
-			gang.PluginName:        gang.New,
-			priority.PluginName:    priority.New,
-			pdb.PluginName:         pdb.New,
-			predicates.PluginName:  predicates.New,
-			rrbinpack.PluginName:   rrbinpack.New,
+			conformance.PluginName:       conformance.New,
+			gang.PluginName:              gang.New,
+			priority.PluginName:          priority.New,
+			pdb.PluginName:               pdb.New,
+			predicates.PluginName:        predicates.New,
+			workloadplacement.PluginName: workloadplacement.New,
 		},
 		Queues:        []*schedulingv1beta1.Queue{util.BuildQueue("q", 1, nil)},
 		DeviceClasses: []*resourcev1.DeviceClass{util.BuildDeviceClass(draClass, nil, nil)},
@@ -300,7 +323,9 @@ func rrBinpackDRAFixture() *uthelper.TestCommonStruct {
 		if name >= "D" {
 			zone = "binpack"
 		}
-		fixture.Nodes = append(fixture.Nodes, util.BuildNode(name, capacity, map[string]string{nodegroup.NodeGroupNameKey: zone}))
+		node := util.BuildNode(name, capacity, nil)
+		node.Annotations = map[string]string{workloadplacement.SchedulingAlgorithmsAnnotation: zone}
+		fixture.Nodes = append(fixture.Nodes, node)
 		devices := make([]resourcev1.Device, 8)
 		for i := range devices {
 			devices[i] = util.BuildDevice(fmt.Sprintf("gpu-%d", i), nil, nil)
@@ -337,10 +362,18 @@ func rrBinpackDRAFixture() *uthelper.TestCommonStruct {
 				UID: types.UID("test-" + name)}}
 		}
 		fixture.ResourceClaims = append(fixture.ResourceClaims, claim)
-		labels[rrbinpack.WorkloadClassLabel] = class
+		labels["example.com/workload-kind"] = class
+		labels["app.kubernetes.io/name"] = group
+		if class == "training" {
+			labels[schedulingv1beta1.PodPreemptable] = "false"
+		}
 		pod := util.BuildPodWithResourceClaim("test", name, node, v1.PodPending, api.BuildResourceList("100m", "128Mi"),
 			group, labels, nil, []v1.ResourceClaim{{Name: "gpu", Request: "gpu"}},
 			[]v1.PodResourceClaim{{Name: "gpu", ResourceClaimName: ptr.To(claimName)}})
+		pod.Annotations[workloadplacement.SchedulingAlgorithmsAnnotation] = "rr,binpack"
+		if class == "training" {
+			pod.Annotations[workloadplacement.SchedulingAlgorithmsAnnotation] = "binpack,rr"
+		}
 		if node != "" {
 			pod.Status.Phase = v1.PodRunning
 		}
@@ -377,14 +410,14 @@ func zoneForDRANode(name string) string {
 	return "rr"
 }
 
-func rrBinpackDRATiers() []conf.Tier {
+func workloadPlacementDRATiers() []conf.Tier {
 	yes, no := true, false
 	return []conf.Tier{{Plugins: []conf.PluginOption{
 		{Name: conformance.PluginName, EnabledPreemptable: &yes},
 		{Name: gang.PluginName, EnabledPreemptable: &no, EnabledJobPipelined: &yes},
 		{Name: priority.PluginName, EnabledPreemptable: &yes, EnabledJobOrder: &yes, EnabledTaskOrder: &yes, EnabledJobStarving: &yes},
 		{Name: pdb.PluginName, EnabledPreemptable: &yes},
-		{Name: rrbinpack.PluginName, EnabledPreemptable: &yes, EnabledPredicate: &yes, EnabledBestNode: &yes},
+		{Name: workloadplacement.PluginName, EnabledPredicate: &yes, EnabledBestNode: &yes},
 		{Name: predicates.PluginName, EnabledPredicate: &yes,
 			Arguments: framework.Arguments{predicates.DynamicResourceAllocationEnable: true}},
 	}}}

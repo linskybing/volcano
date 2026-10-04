@@ -1,8 +1,10 @@
-# RR spread, Binpack overflow, and training preemption
+# Workload and node scheduling algorithms
 
-The `rr-binpack` plugin applies to Pods labeled `volcano.sh/workload-class=inference` or `volcano.sh/workload-class=training`. GPUs may be requested either as a normal extended resource (for example `nvidia.com/gpu`) or through DRA. A DRA Pod must use an independent `ResourceClaim` (or a `ResourceClaimTemplate` that creates one claim per Pod) with `allocationMode: ExactCount`. No GPU resource name, class, or count is configured in the policy. Training Pods need a higher priority than inference: set it on the PodGroup (Volcano compares job priority across jobs) or through the Pods' `priorityClassName`. Mark inference Pods `volcano.sh/preemptable: "true"`, and configure PodDisruptionBudgets where needed.
+The `workload-placement` plugin lets a Pod choose scheduling algorithms from those advertised by a node. Annotate a node with `volcano.sh/scheduling-algorithms: "rr,binpack"` to support both algorithms, or list either one. Annotate a Pod template with the same key to set its preference order. For each candidate node, the first algorithm in the Pod's list that the node supports is used. `rr` spreads replicas of the same workload; `binpack` prefers nodes with higher utilization of the Pod's requested CPU, memory, extended resources, and DRA devices. The plugin currently implements these two algorithms only.
 
-Label any number of nodes `volcano.sh/nodegroup-name=rr` or `volcano.sh/nodegroup-name=binpack`. Inference Pods also need a stable `app.kubernetes.io/name` service label. The node label key, both zone values, workload class label and values, and service identity label are configurable; the values above are defaults. Neither node names nor device counts are configured. Other Pods retain the ordinary scheduler behavior.
+Replicas are grouped by their Volcano job (PodGroup): a vcjob's Pods, or the Pods of one ReplicaSet, form one workload, so no extra label is needed. (A Deployment rollout creates a new ReplicaSet and thus a new group, unless the controller's `podgroup-level-rules` group Pods by Deployment.) RR counts the workload's non-releasing replicas on each node. Pods without a scheduling annotation retain ordinary Volcano behavior. An invalid policy or no matching node leaves an annotated Pod Pending with a scheduling reason.
+
+Volcano's normal `preemptionPolicy`, `volcano.sh/preemptable`, priority, and PodDisruptionBudget rules decide whether preemption is allowed and which Pods can be victims. No workload class has special preemption rights or protection. GPUs may be requested as an extended resource (for example `nvidia.com/gpu`) or through DRA. DRA preemption simulation supports independent whole-device `ExactCount` claims; other claim forms cannot be simulated safely.
 
 Enable the normal `preempt` action (and Volcano's DRA predicate if you use DRA). Keep the victim filter plugins in the same tier so priority, preemptibility, and PDB decisions all apply:
 
@@ -15,15 +17,7 @@ tiers:
     enablePreemptable: false
   - name: conformance
   - name: pdb
-  - name: rr-binpack
-    arguments:
-      serviceIdentityLabel: app.kubernetes.io/name
-      nodeZoneLabel: volcano.sh/nodegroup-name
-      rrZoneValue: rr
-      binpackZoneValue: binpack
-      workloadClassLabel: volcano.sh/workload-class
-      inferenceValue: inference
-      trainingValue: training
+  - name: workload-placement
 - plugins:
   - name: overcommit
   - name: drf
@@ -35,11 +29,9 @@ tiers:
   - name: nodeorder
 ```
 
-Inference uses the RR node with the fewest replicas of its service among nodes that pass normal predicates. If no RR node fits, it uses the most-allocated Binpack node. For extended resources this uses Volcano's binpack formula (`ResourceBinPackingScore`) over the requested extended resources. For DRA it uses the allocated fraction of matching `DeviceClass` devices, read from current `ResourceSlice` and claim state. Existing node score and name break ties. Normal resource and DRA fit checks still decide whether a candidate can actually fit.
+For normal placement, the first preferred algorithm with a fitting node wins. RR chooses the node with the fewest replicas of the same job; Binpack uses Volcano's resource binpacking formula and the allocated fraction of matching DRA devices. During preemption, only priority and fairness matter: lower-priority victims go first, and among equal priorities the plugin always evicts from the job that would lose the smallest share of its replicas (counting replicas already releasing). Candidate nodes are ordered by the highest victim priority, then the worst share any single job would lose, then the number of victims. Normal fit checks, priority, preemptibility, and PDB checks still apply. For DRA, the plugin simulates releasing eligible victims' exclusive whole-device claims in a private snapshot and checks the requesting claim with the Kubernetes allocator. Victims without DRA claims are allowed; a missing, shared, or unsupported DRA claim makes that candidate ineligible.
 
-Training first uses a fitting Binpack node. If none fits, normal preemption considers RR nodes before Binpack nodes, even when a Binpack node has fewer victims. With extended resources, Volcano's native resource accounting decides fit after the victims are evicted. With DRA, the plugin simulates the release of eligible inference Pods' exclusive, whole-device claims in a private DRA snapshot and runs the Kubernetes structured allocator for the training claim; a missing, shared, or unsupported victim claim makes that candidate ineligible. The normal Volcano victim filters, predicates, priority, and PDB checks still apply. Training Pods already running on a node are protected.
-
-After successful preemption, Volcano evicts the victims and nominates the training Pod to the chosen node. Victim termination (and, with DRA, claim release) is asynchronous: training remains Pending until the resources are freed and the ordinary predicates can bind it. During this interval, lower-priority inference replacements cannot take the nominated node. Controllers recreate evicted Pods and they schedule normally elsewhere. Use `enableTopologyAwarePreemption: false` for the normal preempt action (the default).
+After successful preemption, Volcano evicts the victims and nominates the requesting Pod to the chosen node. Victim termination and DRA claim release are asynchronous; the Pod remains Pending until ordinary predicates can bind it. Lower-priority replacements cannot take the nominated node. Use `enableTopologyAwarePreemption: false` for the normal preempt action (the default).
 
 For DRA, this policy requires a functioning DRA driver and the [Volcano DRA setup](how_to_enable_dra.md). End-to-end validation on a real cluster is required before production use; fake scheduler tests cannot verify driver release timing or kubelet behavior.
 
@@ -50,7 +42,7 @@ No GPUs are needed: each worker advertises `nvidia.com/gpu: 8` as an extended re
 ```bash
 printf 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n- role: control-plane\n%s' "$(printf -- '- role: worker\n%.0s' 1 2 3 4 5)" | kind create cluster --name rr --config -
 i=0; for n in rr-worker rr-worker2 rr-worker3 rr-worker4 rr-worker5; do i=$((i+1)); z=rr; [ $i -ge 4 ] && z=binpack
-  kubectl label node $n volcano.sh/nodegroup-name=$z
+  kubectl annotate node $n volcano.sh/scheduling-algorithms=$z
   kubectl patch node $n --subresource=status --type=json -p '[{"op":"add","path":"/status/capacity/nvidia.com~1gpu","value":"8"}]'; done
 make vc-scheduler-image TAG=rr-test && kind load docker-image volcanosh/vc-scheduler:rr-test --name rr
 helm install volcano installer/helm/chart/volcano -n volcano-system --create-namespace \
@@ -74,13 +66,13 @@ spec:
   selector: {matchLabels: {app.kubernetes.io/name: $1}}
   template:
     metadata:
-      labels: {app.kubernetes.io/name: $1, volcano.sh/workload-class: inference}
-      annotations: {volcano.sh/preemptable: "true"}
+      labels: {app.kubernetes.io/name: $1}
+      annotations: {volcano.sh/scheduling-algorithms: "rr,binpack", volcano.sh/preemptable: "true"}
     spec:
       schedulerName: volcano
       priorityClassName: low
       terminationGracePeriodSeconds: 0
-      containers: [{name: c, image: registry.k8s.io/pause:3.10, resources: {requests: {cpu: 10m}, limits: {nvidia.com/gpu: 1}}}]
+      containers: [{name: c, image: "registry.k8s.io/pause:3.10", resources: {requests: {cpu: 10m}, limits: {nvidia.com/gpu: 1}}}]
 YAML
 }
 training() {
@@ -93,7 +85,7 @@ spec:
   minAvailable: 1
   priorityClassName: $2
   tasks:
-  - {name: worker, replicas: 1, template: {metadata: {labels: {volcano.sh/workload-class: training}}, spec: {priorityClassName: $2, terminationGracePeriodSeconds: 0, containers: [{name: c, image: registry.k8s.io/pause:3.10, resources: {requests: {cpu: 10m}, limits: {nvidia.com/gpu: 8}}}]}}}
+  - {name: worker, replicas: 1, template: {metadata: {labels: {app.kubernetes.io/name: $1}, annotations: {volcano.sh/scheduling-algorithms: "binpack,rr", volcano.sh/preemptable: "false"}}, spec: {priorityClassName: $2, terminationGracePeriodSeconds: 0, containers: [{name: c, image: "registry.k8s.io/pause:3.10", resources: {requests: {cpu: 10m}, limits: {nvidia.com/gpu: 8}}}]}}}
 YAML
 }
 pdb() { kubectl create pdb $(echo $1 | tr A-Z a-z) --selector=app.kubernetes.io/name=$1 --min-available=${2:-4}; }
@@ -105,8 +97,8 @@ show() { kubectl get pods -o custom-columns=SVC:.metadata.labels.app\\.kubernete
 | 1 | `for j in J1 J2 J3 J4; do inference $j; pdb $j; done` | each service 2/2/2 on workers 1–3; workers 4–5 empty |
 | 2 | `inference J5` | 6 × J5 on worker4; worker5 empty |
 | 3 | `training t1 medium` | t1 on worker5, no evictions |
-| 4 | `training t2 high` | 2 × J1–J4 evicted from worker1; t2 on worker1; t1 stays; 2 replacements on worker4, 6 Pending |
-| 5 | `training t3 high` | J2/J4 PDBs now allow 0 disruptions, so worker2/3 are skipped; t3 preempts worker4 (last resort) |
+| 4 | `training t2 high` | worker1 costs each job 2/6 of its replicas, worker4 would cost J5 6/6: 2 × J1–J4 evicted from worker1; t2 on worker1; t1 stays; 2 replacements on worker4, 6 Pending |
+| 5 | `training t3 high` | J2/J4 PDBs now allow 0 disruptions, so worker2/3 are skipped; t3 preempts worker4 (only candidate left) |
 | 6 | `training t4 high` | no legal candidate: t4 Pending, no evictions |
 
 ### DRA variant
@@ -135,4 +127,4 @@ done
 
 In the helpers, replace `limits: {nvidia.com/gpu: N}` with `claims: [{name: gpu}]` and add `resourceClaims: [{name: gpu, resourceClaimTemplateName: gpuN}]` to the Pod spec (`gpu1` for inference, `gpu8` for training). Check claim placement (one line per claim; a training claim holds all 8 devices; blank = unallocated) with `kubectl get resourceclaims -o jsonpath='{range .items[*]}{.status.allocation.devices.results[0].pool}{"\n"}{end}' | sort | uniq -c`.
 
-Decisions are logged at `-v=4` (`rr-binpack selected node`, `Considering Task`, `Try to preempt Task`). Clean up with `kind delete cluster --name rr`.
+Decisions are logged at `-v=4` (`workload-placement selected node`, `Considering Task`, `Try to preempt Task`). Clean up with `kind delete cluster --name rr`.

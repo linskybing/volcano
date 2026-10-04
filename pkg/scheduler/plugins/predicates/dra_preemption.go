@@ -48,7 +48,7 @@ func (pp *PredicatesPlugin) draFitsAfterEviction(ssn *framework.Session, task *a
 			continue
 		}
 		if len(victim.ResourceClaimKeys) == 0 {
-			return fail(fmt.Sprintf("victim %s has no DRA claim", victim.Name))
+			continue
 		}
 		for _, key := range victim.ResourceClaimKeys {
 			claim, err := draClaimByKey(ssn, key)
@@ -71,12 +71,12 @@ func (pp *PredicatesPlugin) draFitsAfterEviction(ssn *framework.Session, task *a
 	for _, key := range task.ResourceClaimKeys {
 		claim, err := draClaimByKey(ssn, key)
 		if err != nil || !exclusiveExactlyCountClaim(claim) || claim.Status.Allocation != nil {
-			return fail(fmt.Sprintf("training claim %s is missing or unsupported", key))
+			return fail(fmt.Sprintf("requesting claim %s is missing or unsupported", key))
 		}
 		claims = append(claims, claim)
 	}
 	if len(claims) == 0 {
-		return fail("training task has no DRA claims")
+		return fail("requesting task has no DRA claims")
 	}
 	slices, err := manager.ResourceSlices().ListWithDeviceTaintRules()
 	if err != nil {

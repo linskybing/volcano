@@ -42,11 +42,11 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/plugins/rescheduling"
 	resourcestrategyfit "volcano.sh/volcano/pkg/scheduler/plugins/resource-strategy-fit"
 	"volcano.sh/volcano/pkg/scheduler/plugins/resourcequota"
-	"volcano.sh/volcano/pkg/scheduler/plugins/rrbinpack"
 	"volcano.sh/volcano/pkg/scheduler/plugins/sla"
 	tasktopology "volcano.sh/volcano/pkg/scheduler/plugins/task-topology"
 	"volcano.sh/volcano/pkg/scheduler/plugins/tdm"
 	"volcano.sh/volcano/pkg/scheduler/plugins/usage"
+	"volcano.sh/volcano/pkg/scheduler/plugins/workloadplacement"
 )
 
 func init() {
@@ -67,7 +67,7 @@ func init() {
 	framework.RegisterPluginBuilder(numaaware.PluginName, numaaware.New)
 	framework.RegisterPluginBuilder(cdp.PluginName, cdp.New)
 	framework.RegisterPluginBuilder(rescheduling.PluginName, rescheduling.New)
-	framework.RegisterPluginBuilder(rrbinpack.PluginName, rrbinpack.New)
+	framework.RegisterPluginBuilder(workloadplacement.PluginName, workloadplacement.New)
 	framework.RegisterPluginBuilder(usage.PluginName, usage.New)
 	framework.RegisterPluginBuilder(pdb.PluginName, pdb.New)
 	framework.RegisterPluginBuilder(nodegroup.PluginName, nodegroup.New)

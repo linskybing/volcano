@@ -124,6 +124,8 @@ type Session struct {
 	draPreemptionEligibleFns     map[string]func(*api.TaskInfo) bool
 	prePredicateFns              map[string]api.PrePredicateFn
 	bestNodeFns                  map[string]api.BestNodeFn
+	preemptNodeOrderFns          map[string]func(*api.TaskInfo, []*api.NodeInfo) []*api.NodeInfo
+	preemptVictimOrderFns        map[string]func(*api.TaskInfo, []*api.TaskInfo) []*api.TaskInfo
 	nodeOrderFns                 map[string]api.NodeOrderFn
 	batchNodeOrderFns            map[string]api.BatchNodeOrderFn
 	nodeMapFns                   map[string]api.NodeMapFn
@@ -201,6 +203,8 @@ func openSession(cache cache.Cache) *Session {
 		draPreemptionEligibleFns:      map[string]func(*api.TaskInfo) bool{},
 		prePredicateFns:               map[string]api.PrePredicateFn{},
 		bestNodeFns:                   map[string]api.BestNodeFn{},
+		preemptNodeOrderFns:           map[string]func(*api.TaskInfo, []*api.NodeInfo) []*api.NodeInfo{},
+		preemptVictimOrderFns:         map[string]func(*api.TaskInfo, []*api.TaskInfo) []*api.TaskInfo{},
 		nodeOrderFns:                  map[string]api.NodeOrderFn{},
 		batchNodeOrderFns:             map[string]api.BatchNodeOrderFn{},
 		nodeMapFns:                    map[string]api.NodeMapFn{},
@@ -692,12 +696,7 @@ func (ssn *Session) PredicateForAllocateAction(task *api.TaskInfo, node *api.Nod
 // - UnschedulableAndUnresolvable
 // - ErrorSkipOrWait
 func (ssn *Session) PredicateForPreemptAction(task *api.TaskInfo, node *api.NodeInfo) error {
-	var err error
-	if ssn.DRAPreemptionEligible(task) {
-		err = ssn.PredicateBeforePreemption(task, node)
-	} else {
-		err = ssn.PredicateFn(task, node)
-	}
+	err := ssn.PredicateBeforePreemption(task, node)
 	if err == nil {
 		return nil
 	}

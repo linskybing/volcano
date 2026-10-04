@@ -118,7 +118,7 @@ func (ssn *Session) DRAPreemptionEligible(task *api.TaskInfo) bool {
 	}
 	for _, tier := range ssn.Tiers {
 		for _, plugin := range tier.Plugins {
-			if isEnabled(plugin.EnabledPredicate) && isEnabled(plugin.EnabledPreemptable) {
+			if isEnabled(plugin.EnabledPredicate) {
 				if fn := ssn.draPreemptionEligibleFns[plugin.Name]; fn != nil && fn(task) {
 					return true
 				}
@@ -136,6 +136,14 @@ func (ssn *Session) AddPrePredicateFn(name string, pf api.PrePredicateFn) {
 // AddBestNodeFn add BestNode function
 func (ssn *Session) AddBestNodeFn(name string, pf api.BestNodeFn) {
 	ssn.bestNodeFns[name] = pf
+}
+
+// AddPreemptOrderFns lets a plugin order the candidate nodes of normal preemption
+// and the victims evicted on a node. A function returning nil keeps the default order.
+func (ssn *Session) AddPreemptOrderFns(name string, nodes func(*api.TaskInfo, []*api.NodeInfo) []*api.NodeInfo,
+	victims func(*api.TaskInfo, []*api.TaskInfo) []*api.TaskInfo) {
+	ssn.preemptNodeOrderFns[name] = nodes
+	ssn.preemptVictimOrderFns[name] = victims
 }
 
 // AddNodeOrderFn add Node order function
@@ -1059,6 +1067,32 @@ func (ssn *Session) BestNodeFn(task *api.TaskInfo, nodeScores map[float64][]*api
 		}
 	}
 	return nil
+}
+
+// PreemptNodeOrder returns the first plugin order of preemption candidate nodes.
+func (ssn *Session) PreemptNodeOrder(task *api.TaskInfo, nodes []*api.NodeInfo) []*api.NodeInfo {
+	return preemptOrder(ssn, ssn.preemptNodeOrderFns, task, nodes)
+}
+
+// PreemptVictimOrder returns the first plugin order of victims on a node.
+func (ssn *Session) PreemptVictimOrder(task *api.TaskInfo, victims []*api.TaskInfo) []*api.TaskInfo {
+	return preemptOrder(ssn, ssn.preemptVictimOrderFns, task, victims)
+}
+
+func preemptOrder[T any](ssn *Session, fns map[string]func(*api.TaskInfo, []T) []T, task *api.TaskInfo, items []T) []T {
+	for _, tier := range ssn.Tiers {
+		for _, plugin := range tier.Plugins {
+			if !isEnabled(plugin.EnabledBestNode) {
+				continue
+			}
+			if fn := fns[plugin.Name]; fn != nil {
+				if ordered := fn(task, items); ordered != nil {
+					return ordered
+				}
+			}
+		}
+	}
+	return items
 }
 
 // NodeOrderFn invoke node order function of the plugins

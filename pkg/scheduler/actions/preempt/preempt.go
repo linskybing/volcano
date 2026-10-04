@@ -340,38 +340,7 @@ func (pmpt *Action) normalPreempt(
 ) (bool, error) {
 	nodeScores := util.PrioritizeNodes(preemptor, predicateNodes, ssn.BatchNodeOrderFn, ssn.NodeOrderMapFn, ssn.NodeOrderReduceFn)
 
-	// Let a plugin order candidates; without a choice, retain the original score order.
-	// ponytail: repeated BestNode calls are O(n²); add an ordering hook only if large candidate sets make this costly.
-	selectedNodes := make([]*api.NodeInfo, 0, len(predicateNodes))
-	for len(nodeScores) > 0 {
-		best := ssn.BestNodeFn(preemptor, nodeScores)
-		if best == nil {
-			selectedNodes = append(selectedNodes, util.SortNodes(nodeScores)...)
-			break
-		}
-		found := false
-		for score, nodes := range nodeScores {
-			for i, node := range nodes {
-				if node.Name != best.Name {
-					continue
-				}
-				selectedNodes = append(selectedNodes, node)
-				nodeScores[score] = append(nodes[:i], nodes[i+1:]...)
-				if len(nodeScores[score]) == 0 {
-					delete(nodeScores, score)
-				}
-				found = true
-				break
-			}
-			if found {
-				break
-			}
-		}
-		if !found {
-			selectedNodes = append(selectedNodes, util.SortNodes(nodeScores)...)
-			break
-		}
-	}
+	selectedNodes := ssn.PreemptNodeOrder(preemptor, util.SortNodes(nodeScores))
 
 	job, found := ssn.Jobs[preemptor.Job]
 	if !found {
@@ -409,15 +378,18 @@ func (pmpt *Action) normalPreempt(
 		nodeStmt := framework.NewStatement(ssn)
 
 		victimsQueue := ssn.BuildVictimsPriorityQueue(victims, preemptor)
+		ordered := make([]*api.TaskInfo, 0, len(victims))
+		for !victimsQueue.Empty() {
+			ordered = append(ordered, victimsQueue.Pop().(*api.TaskInfo))
+		}
 		// Preempt victims for tasks, pick lowest priority task first.
 		preempted := api.EmptyResource()
 		preemptorFits := preemptorFitsOnNode(ssn, currentQueue, preemptor, node)
 
-		for !victimsQueue.Empty() {
+		for _, preemptee := range ssn.PreemptVictimOrder(preemptor, ordered) {
 			if preemptorFits {
 				break
 			}
-			preemptee := victimsQueue.Pop().(*api.TaskInfo)
 			klog.V(3).Infof("Try to preempt Task <%s/%s> for Task <%s/%s>",
 				preemptee.Namespace, preemptee.Name, preemptor.Namespace, preemptor.Name)
 			nodeStmt.Evict(preemptee, "preempt")
