@@ -386,6 +386,7 @@ func (pmpt *Action) normalPreempt(
 		preempted := api.EmptyResource()
 		preemptorFits := preemptorFitsOnNode(ssn, currentQueue, preemptor, node)
 
+		var evicted []*api.TaskInfo
 		for _, preemptee := range ssn.PreemptVictimOrder(preemptor, ordered) {
 			if preemptorFits {
 				break
@@ -393,8 +394,22 @@ func (pmpt *Action) normalPreempt(
 			klog.V(3).Infof("Try to preempt Task <%s/%s> for Task <%s/%s>",
 				preemptee.Namespace, preemptee.Name, preemptor.Namespace, preemptor.Name)
 			nodeStmt.Evict(preemptee, "preempt")
+			evicted = append(evicted, preemptee)
 			preempted.Add(preemptee.Resreq)
 			preemptorFits = preemptorFitsOnNode(ssn, currentQueue, preemptor, node)
+		}
+
+		// Reprieve victims the later evictions made unnecessary, latest first as in SelectVictimsOnNode.
+		for i := len(evicted) - 1; preemptorFits && i >= 0; i-- {
+			if err := nodeStmt.Unevict(evicted[i]); err != nil {
+				klog.Errorf("Failed to reprieve Task <%s/%s>: %v", evicted[i].Namespace, evicted[i].Name, err)
+				continue
+			}
+			if preemptorFitsOnNode(ssn, currentQueue, preemptor, node) {
+				preempted.Sub(evicted[i].Resreq)
+				continue
+			}
+			nodeStmt.Evict(evicted[i], "preempt")
 		}
 
 		evictionOccurred := false

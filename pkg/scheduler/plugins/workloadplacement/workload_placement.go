@@ -163,10 +163,7 @@ func (p *plugin) OnSessionOpen(ssn *framework.Session) {
 		if _, configured, err := taskPolicy(task); !configured || err != nil {
 			return nil
 		}
-		dra, devices := p.draUsage(ssn, task), int64(0)
-		for _, req := range task.DRAResreq {
-			devices += req.Count
-		}
+		dra, devices := p.draUsage(ssn, task), draCount(task)
 		type cost struct {
 			prio      int32
 			loss      float64
@@ -187,21 +184,35 @@ func (p *plugin) OnSessionOpen(ssn *framework.Session) {
 				need -= int64(u.total - u.used)
 			}
 			fits := func() bool { return task.InitResreq.LessEqual(free, api.Zero) && need <= 0 }
-			c, evicted := cost{prio: math.MinInt32}, map[api.JobID]int{}
+			var victims []*api.TaskInfo
 			for _, victim := range f.order(ssn.Preemptable(task, candidates), jobPriority) {
 				if fits() {
 					break
 				}
 				free.Add(victim.Resreq)
-				for _, req := range victim.DRAResreq {
-					need -= req.Count
+				need -= draCount(victim)
+				victims = append(victims, victim)
+			}
+			c := cost{prio: math.MinInt32}
+			if !fits() {
+				c.loss = math.Inf(1)
+			}
+			// Mirror the preempt action's reprieve so the cost counts only the victims it keeps.
+			for i := len(victims) - 1; c.loss == 0 && i >= 0; i-- {
+				free.Sub(victims[i].Resreq)
+				need += draCount(victims[i])
+				if fits() {
+					victims = slices.Delete(victims, i, i+1)
+					continue
 				}
+				free.Add(victims[i].Resreq)
+				need -= draCount(victims[i])
+			}
+			evicted := map[api.JobID]int{}
+			for _, victim := range victims {
 				evicted[victim.Job]++
 				c.prio, c.loss = max(c.prio, jobPriority(victim)), max(c.loss, f.loss(victim.Job, evicted[victim.Job]))
 				c.evictions++
-			}
-			if !fits() {
-				c.loss = math.Inf(1)
 			}
 			costs[node.Name] = c
 		}
@@ -307,6 +318,14 @@ func nodeAlgorithm(node *api.NodeInfo, order []string) (int, string) {
 		}
 	}
 	return len(order), ""
+}
+
+func draCount(task *api.TaskInfo) int64 {
+	var n int64
+	for _, req := range task.DRAResreq {
+		n += req.Count
+	}
+	return n
 }
 
 func jobReplicas(node *api.NodeInfo, job api.JobID) int {

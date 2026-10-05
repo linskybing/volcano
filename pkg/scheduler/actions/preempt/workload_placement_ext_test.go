@@ -266,6 +266,51 @@ func TestWorkloadPlacementFairVictims(t *testing.T) {
 	}
 }
 
+// TestWorkloadPlacementReprievesVictims evicts the small-loss A replicas first, then B;
+// B alone frees enough GPUs, so the A replicas must be reprieved.
+func TestWorkloadPlacementReprievesVictims(t *testing.T) {
+	gpus := func(n string) v1.ResourceList {
+		return api.BuildResourceList("100m", "128Mi", api.ScalarResource{Name: api.GPUResourceName, Value: n})
+	}
+	node := util.BuildNode("X", api.BuildResourceList("32", "64Gi", api.ScalarResource{Name: "pods", Value: "110"},
+		api.ScalarResource{Name: api.GPUResourceName, Value: "8"}), nil)
+	node.Annotations = map[string]string{workloadplacement.SchedulingAlgorithmsAnnotation: "rr"}
+	fixture := workloadPlacementDRAFixture()
+	fixture.Pods, fixture.PodGroups, fixture.ResourceClaims, fixture.ResourceSlices = nil, nil, nil, nil
+	fixture.Nodes = []*v1.Node{node}
+	for _, job := range []struct {
+		name, prio, gpu string
+		running, totals int
+	}{{"A", "low", "1", 2, 8}, {"B", "low", "6", 1, 2}, {"T", "high", "6", 0, 1}} {
+		fixture.PodGroups = append(fixture.PodGroups, util.BuildPodGroupWithPrio(job.name, "test", "q", 1,
+			nil, schedulingv1beta1.PodGroupInqueue, job.prio))
+		for r := 1; r <= job.totals; r++ {
+			host, phase := "X", v1.PodRunning
+			if r > job.running {
+				host, phase = "", v1.PodPending
+			}
+			pod := util.BuildPod("test", fmt.Sprintf("%s-%d", job.name, r), host, phase, gpus(job.gpu), job.name,
+				map[string]string{schedulingv1beta1.PodPreemptable: fmt.Sprint(job.name != "T")}, nil)
+			pod.Annotations[workloadplacement.SchedulingAlgorithmsAnnotation] = "rr"
+			fixture.Pods = append(fixture.Pods, pod)
+		}
+	}
+	ssn := fixture.RegisterSession(workloadPlacementDRATiers(), []conf.Configuration{{Name: "preempt",
+		Arguments: map[string]interface{}{EnableTopologyAwarePreemptionKey: false}}})
+	defer fixture.Close()
+	fixture.Run([]framework.Action{New()})
+	got := map[string]int{}
+	for _, group := range []string{"A", "B"} {
+		got[group] = len(ssn.Jobs[api.JobID("test/"+group)].TaskStatusIndex[api.Releasing])
+	}
+	if want := map[string]int{"A": 0, "B": 1}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("evictions per job = %v, want %v", got, want)
+	}
+	if task := ssn.Jobs["test/T"].Tasks["test-T-1"]; task.Status != api.Pipelined {
+		t.Fatalf("T status = %s, want Pipelined", task.Status)
+	}
+}
+
 // BenchmarkWorkloadPlacementPreempt runs one preempt action for a full-node
 // training pod on n nodes, each filled with 8 single-GPU replicas of 16 jobs.
 func BenchmarkWorkloadPlacementPreempt(b *testing.B) {

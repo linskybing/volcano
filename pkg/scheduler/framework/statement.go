@@ -25,6 +25,7 @@ package framework
 import (
 	"errors"
 	"fmt"
+	"slices"
 
 	"k8s.io/klog/v2"
 
@@ -97,6 +98,17 @@ func (s *Statement) Evict(reclaimee *api.TaskInfo, reason string) {
 		task:   reclaimee,
 		reason: reason,
 	})
+}
+
+// Unevict reverts an Evict recorded in this statement.
+func (s *Statement) Unevict(reclaimee *api.TaskInfo) error {
+	for i, op := range s.operations {
+		if op.name == Evict && op.task == reclaimee {
+			s.operations = slices.Delete(s.operations, i, i+1)
+			return s.unevict(reclaimee)
+		}
+	}
+	return fmt.Errorf("task <%v/%v> was not evicted in this statement", reclaimee.Namespace, reclaimee.Name)
 }
 
 func (s *Statement) evict(reclaimee *api.TaskInfo, reason string) error {
