@@ -1,3 +1,19 @@
+/*
+Copyright 2026 The Volcano Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package preempt
 
 import (
@@ -308,6 +324,46 @@ func TestWorkloadPlacementReprievesVictims(t *testing.T) {
 	}
 	if task := ssn.Jobs["test/T"].Tasks["test-T-1"]; task.Status != api.Pipelined {
 		t.Fatalf("T status = %s, want Pipelined", task.Status)
+	}
+}
+
+// TestWorkloadPlacementCountsPendingAsLost: A runs 4 of 8 replicas, so one more eviction leaves
+// A at 3/8 alive while evicting B leaves B at 1/2; B must be the victim.
+func TestWorkloadPlacementCountsPendingAsLost(t *testing.T) {
+	gpus := api.BuildResourceList("100m", "128Mi", api.ScalarResource{Name: api.GPUResourceName, Value: "1"})
+	node := util.BuildNode("X", api.BuildResourceList("32", "64Gi", api.ScalarResource{Name: "pods", Value: "110"},
+		api.ScalarResource{Name: api.GPUResourceName, Value: "6"}), nil)
+	node.Annotations = map[string]string{workloadplacement.SchedulingAlgorithmsAnnotation: "rr"}
+	fixture := workloadPlacementDRAFixture()
+	fixture.Pods, fixture.PodGroups, fixture.ResourceClaims, fixture.ResourceSlices = nil, nil, nil, nil
+	fixture.Nodes = []*v1.Node{node}
+	for _, job := range []struct {
+		name, prio      string
+		running, totals int
+	}{{"A", "low", 4, 8}, {"B", "low", 2, 2}, {"T", "high", 0, 1}} {
+		fixture.PodGroups = append(fixture.PodGroups, util.BuildPodGroupWithPrio(job.name, "test", "q", 1,
+			nil, schedulingv1beta1.PodGroupInqueue, job.prio))
+		for r := 1; r <= job.totals; r++ {
+			host, phase := "X", v1.PodRunning
+			if r > job.running {
+				host, phase = "", v1.PodPending
+			}
+			pod := util.BuildPod("test", fmt.Sprintf("%s-%d", job.name, r), host, phase, gpus, job.name,
+				map[string]string{schedulingv1beta1.PodPreemptable: fmt.Sprint(job.name != "T")}, nil)
+			pod.Annotations[workloadplacement.SchedulingAlgorithmsAnnotation] = "rr"
+			fixture.Pods = append(fixture.Pods, pod)
+		}
+	}
+	ssn := fixture.RegisterSession(workloadPlacementDRATiers(), []conf.Configuration{{Name: "preempt",
+		Arguments: map[string]interface{}{EnableTopologyAwarePreemptionKey: false}}})
+	defer fixture.Close()
+	fixture.Run([]framework.Action{New()})
+	got := map[string]int{}
+	for _, group := range []string{"A", "B"} {
+		got[group] = len(ssn.Jobs[api.JobID("test/"+group)].TaskStatusIndex[api.Releasing])
+	}
+	if want := map[string]int{"A": 0, "B": 1}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("evictions per job = %v, want %v", got, want)
 	}
 }
 

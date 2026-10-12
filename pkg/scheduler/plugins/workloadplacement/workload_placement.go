@@ -177,7 +177,7 @@ func (p *plugin) OnSessionOpen(ssn *framework.Session) {
 					candidates = append(candidates, occupant.Clone())
 				}
 			}
-			// ponytail: estimates fit from requests and free DRA devices; the preempt action still verifies it.
+			// Estimates fit from requests and free DRA devices; the preempt action still verifies it.
 			free, need := node.FutureIdle(), devices
 			if dra != nil {
 				u := dra(node)
@@ -241,13 +241,24 @@ func (p *plugin) OnSessionOpen(ssn *framework.Session) {
 
 func (p *plugin) OnSessionClose(*framework.Session) {}
 
-// fairness tracks the replicas each job has and how many of them are being evicted.
+// fairness tracks the replicas each job should have and how many of them are not alive.
 type fairness struct{ total, lost map[api.JobID]int }
 
 func newFairness(ssn *framework.Session) *fairness {
 	f := &fairness{total: map[api.JobID]int{}, lost: map[api.JobID]int{}}
 	for id, job := range ssn.Jobs {
-		f.total[id], f.lost[id] = len(job.Tasks), len(job.TaskStatusIndex[api.Releasing])
+		// Wanted replicas = pods neither terminating nor finished; this undercounts when a controller
+		// (StatefulSet) waits for old pods to go before creating replacements.
+		alive, total := 0, 0
+		for status, tasks := range job.TaskStatusIndex {
+			if api.AllocatedStatus(status) {
+				alive += len(tasks)
+			}
+			if status != api.Releasing && !api.CompletedStatus(status) {
+				total += len(tasks)
+			}
+		}
+		f.total[id], f.lost[id] = total, total-alive
 	}
 	// Statement.Evict deallocates a Releasing task; only unevict re-allocates a Running one.
 	ssn.AddEventHandler(&framework.EventHandler{
@@ -265,7 +276,7 @@ func newFairness(ssn *framework.Session) *fairness {
 	return f
 }
 
-// loss is the fraction of the job's replicas gone after k more evictions.
+// loss is 1 - alive/wanted after k more evictions; pending and terminating replicas count as lost.
 func (f *fairness) loss(job api.JobID, k int) float64 {
 	return float64(f.lost[job]+k) / float64(max(f.total[job], 1))
 }
